@@ -1,0 +1,256 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <VL53L0X.h>
+
+// Display and sensor setup
+U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0);
+VL53L0X sensor; // VL53L0X sensor object
+const int ADXL345 = 0x53;
+volatile int pot_value = 0;
+// Potentiometer and button pins
+#define POT_PIN A0
+#define BUTTON_PIN 4 // Button pin with debounce
+
+int currentMenu = 0;
+const int menuItems = 4;
+bool menuActive = true;
+bool inMeasurementSubmenu = false;
+int measurementMenuOption = 0;
+float X_out, Y_out, Z_out;
+unsigned long previousSensorTime = 0;
+const unsigned long sensorInterval = 1000;
+float inclination;
+
+// Button debounce variables
+bool buttonPressed = false;
+unsigned long lastButtonPressTime = 0;
+const unsigned long debounceDelay = 50;
+
+// EEPROM memory addresses
+const int EEPROM_ADDR_INCLINATION = 0;
+const int EEPROM_ADDR_RANGE = 10;
+
+// Function to save measurement to EEPROM
+void saveToEEPROM(int address, int value) {
+  EEPROM.put(address, value);
+  Serial.print("Saved to EEPROM at address ");
+  Serial.print(address);
+  Serial.print(": ");
+  Serial.println(value);
+}
+
+// Function to read from EEPROM
+int readFromEEPROM(int address) {
+  int value;
+  EEPROM.get(address, value);
+  return value;
+}
+
+void setup() {
+   // Configurare Timer1
+  TCCR1A = 0; // Resetare registru TCCR1A
+  TCCR1B = 0; // Resetare registru TCCR1B
+  TCCR1B |= (1 << WGM12); // CTC mode
+  TCCR1B |= (1 << CS11) | (1 << CS10); // Prescaler 64
+  OCR1A = 7500; // 30 ms
+  OCR1B = 2500; // 10 ms
+  TIMSK1 |= (1 << OCIE1B); // Activare întrerupere Timer1 Compare Match B
+
+  // Configurare ADCiiwadw
+  ADMUX = (1 << REFS0); // Referință AVCC (5V), canal analogic A0
+  ADCSRA = (1 << ADEN) | (1 << ADATE) | (1 << ADIE) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Activare ADC, auto-trigger, întrerupere activată, prescaler 128
+  ADCSRB = (1 << ADTS2) | (1 << ADTS0); // Declanșare ADC pe Timer1 Compare Match B
+
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Initialize ADXL345
+  Wire.beginTransmission(ADXL345);
+  Wire.write(0x2D);
+  Wire.write(8);
+  Wire.endTransmission();
+
+  // Initialize VL53L0X sensor
+  if (!sensor.init()) {
+    Serial.println("Failed to initialize VL53L0X sensor!");
+    while (true);
+  }
+  sensor.setTimeout(500);
+  sensor.startContinuous();
+  Serial.println("VL53L0X sensor initialized!");
+
+  // Initialize display
+  u8g2.begin();
+
+  // Setup the button pin
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  displayMenu();
+}
+
+void loop() {
+  checkButtonPress(); // Check button with debounce
+
+  if (menuActive) {
+    handleMainMenu();
+  } else if (inMeasurementSubmenu) {
+    handleMeasurementSubmenu();
+  }
+
+  readSensorsIfNeeded();
+}
+
+void checkButtonPress() {
+  bool currentButtonState = digitalRead(BUTTON_PIN) == LOW;
+  unsigned long currentTime = millis();
+
+  if (currentButtonState && !buttonPressed && (currentTime - lastButtonPressTime) > debounceDelay) {
+    buttonPressed = true;
+    lastButtonPressTime = currentTime;
+    if (menuActive) {
+      menuActive = false;
+      inMeasurementSubmenu = true;
+      displayMeasurementSubmenu();
+    } else if (inMeasurementSubmenu) {
+      executeMeasurementAction();
+    }
+  } else if (!currentButtonState) {
+    buttonPressed = false;
+  }
+}
+
+void handleMainMenu() {
+  int newMenu = map(pot_value, 0, 1023, 0, menuItems - 1);
+
+  if (newMenu != currentMenu) {
+    currentMenu = newMenu;
+    displayMenu();
+  }
+}
+
+void handleMeasurementSubmenu() {
+  int numOptions = (currentMenu == 2) ? 1 : 2; // Adjust for "View Saved" submenu
+  int newOption = map(pot_value, 0, 1023, 0, 3 - 1);
+
+  if (newOption != measurementMenuOption) {
+    measurementMenuOption = newOption;
+    displayMeasurementSubmenu();
+  }
+}
+
+void readSensorsIfNeeded() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousSensorTime >= sensorInterval) {
+    previousSensorTime = currentMillis;
+
+    // Read ADXL345 data
+    Wire.beginTransmission(ADXL345);
+    Wire.write(0x32);
+    Wire.endTransmission(false);
+    Wire.requestFrom(ADXL345, 6, true);
+
+    int16_t X_raw = Wire.read() | (Wire.read() << 8);
+    int16_t Y_raw = Wire.read() | (Wire.read() << 8);
+    int16_t Z_raw = Wire.read() | (Wire.read() << 8);
+
+    X_out = X_raw * 0.0039;
+    Y_out = Y_raw * 0.0039;
+    Z_out = Z_raw * 0.0039;
+
+    float magnitude = sqrt(X_out * X_out + Y_out * Y_out + Z_out * Z_out);
+    inclination = (magnitude != 0) ? acos(Z_out / magnitude) * 180 / PI : 0;
+
+    if (inMeasurementSubmenu) displayMeasurementSubmenu();
+  }
+}
+
+void displayMenu() {
+  const char* menuOptions[] = {"1. Inclination", "2. Range", "3. View Saved", "4. Exit"};
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  for (int i = 0; i < menuItems; i++) {
+    if (i == currentMenu) u8g2.drawStr(0, 12 + i * 10, ">");
+    u8g2.drawStr(10, 12 + i * 10, menuOptions[i]);
+  }
+
+  u8g2.sendBuffer();
+}
+
+void displayMeasurementSubmenu() {
+  char buffer[50];
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  if (currentMenu == 2) { // View saved values
+    int savedInclination = readFromEEPROM(EEPROM_ADDR_INCLINATION);
+    int savedRange = readFromEEPROM(EEPROM_ADDR_RANGE);
+
+    snprintf(buffer, sizeof(buffer), "Incl: %d deg, Dist: %d mm", savedInclination, savedRange);
+    u8g2.drawStr(0, 10, buffer);
+
+    const char* measurementOptions[] = {"Exit"};
+    for (int i = 0; i < 1; i++) {
+      if (i == measurementMenuOption) u8g2.drawStr(0, 24 + i * 10, ">");
+      u8g2.drawStr(10, 24 + i * 10, measurementOptions[i]);
+    }
+  } else {
+    switch (currentMenu) {
+      case 0:  // Inclination
+        snprintf(buffer, sizeof(buffer), "Inclination: %d deg", static_cast<int>(round(inclination)));
+        break;
+      case 1:  // Range
+        int rangeInt = sensor.readRangeContinuousMillimeters();
+        if (sensor.timeoutOccurred()) {
+          snprintf(buffer, sizeof(buffer), "Timeout!");
+        } else {
+          snprintf(buffer, sizeof(buffer), "Realtime Range: %d mm", rangeInt);
+        }
+        break;
+    }
+
+    u8g2.drawStr(0, 10, buffer);
+
+    const char* measurementOptions[] = {"Save to EEPROM", "Exit"};
+    for (int i = 0; i < 2; i++) {
+      if (i == measurementMenuOption) u8g2.drawStr(0, 24 + i * 10, ">");
+      u8g2.drawStr(10, 24 + i * 10, measurementOptions[i]);
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
+void executeMeasurementAction() {
+  if (currentMenu == 2) { // View saved values submenu
+    inMeasurementSubmenu = false;
+    menuActive = true;
+    displayMenu();
+  } else {
+    if (measurementMenuOption == 0) {
+      if (currentMenu == 0) {
+        saveToEEPROM(EEPROM_ADDR_INCLINATION, static_cast<int>(round(inclination)));
+      } else if (currentMenu == 1) {
+        int range = sensor.readRangeContinuousMillimeters();
+        if (!sensor.timeoutOccurred()) {
+          saveToEEPROM(EEPROM_ADDR_RANGE, range);
+        }
+      }
+    } else if (measurementMenuOption == 1) {
+      inMeasurementSubmenu = false;
+      menuActive = true;
+      displayMenu();
+    }
+  }
+}
+
+ISR(ADC_vect) {
+  pot_value = ADC; // Actualizare valoare din registrul ADC
+}
+
+ISR(TIMER1_COMPB_vect) {
+  // Această întrerupere este utilizată pentru declanșarea ADC (dacă este necesar, adaugă funcționalitate)
+}
